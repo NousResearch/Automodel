@@ -394,6 +394,8 @@ def apply_lora_to_linear_modules(
                         "package providing MultiLinearLoRA. Install nousnet "
                         "or set n_adapters=1."
                     ) from e
+                if isinstance(lora_dtype, str):
+                    lora_dtype = dtype_from_str(lora_dtype)
                 new_module = MultiLinearLoRA(
                     orig_linear=module,
                     n_adapters=peft_config.n_adapters,
