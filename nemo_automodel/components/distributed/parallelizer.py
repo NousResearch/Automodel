@@ -225,7 +225,16 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
         assert not sequence_parallel, "Sequence parallelism is not supported for NemotronHForCausalLM"
         logger.info("Custom parallel plan is not supported for NemotronHForCausalLM. Using NemotronH-specific TP plan.")
 
-        layers: torch.nn.ModuleList = model.backbone.layers
+        # Different NemotronH custom-code variants name the backbone differently:
+        #   Nano-30B uses model.backbone; Super-120B uses model.model.
+        # Pick whichever attribute holds the NemotronHModel.
+        _backbone = getattr(model, "backbone", None)
+        if _backbone is None:
+            _backbone = getattr(model, "model", None)
+        assert _backbone is not None and hasattr(_backbone, "layers"), (
+            f"{type(model).__name__}: expected .backbone or .model with .layers"
+        )
+        layers: torch.nn.ModuleList = _backbone.layers
         tp_mesh = device_mesh[tp_mesh_name]
         if tp_mesh.size() > 1:
             model_tp_plan: dict[str, ParallelStyle] = {
@@ -237,9 +246,10 @@ class NemotronHParallelizationStrategy(ParallelizationStrategy):
                 "mixer.down_proj": RowwiseParallel(),
             }
 
+
             parallelize_module(model, tp_mesh, model_tp_plan)
 
-            for layer in model.backbone.layers:
+            for layer in _backbone.layers:
                 if layer.block_type == "mlp":
                     parallelize_module(layer, tp_mesh, mlp_tp_plan)
 
