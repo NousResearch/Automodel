@@ -53,6 +53,11 @@ class PeftConfig:
     lora_dtype: Optional[torch.dtype] = None
     use_triton: bool = False
     moe_rank_scaling: bool = False
+    # Number of stacked LoRA adapters per target module. n_adapters=1 (default)
+    # uses the stock LinearLoRA. n_adapters>1 dispatches to a multi-adapter
+    # class provided by an optional downstream package (e.g. nousnet's
+    # MultiLinearLoRA). Passthrough is automatic via apply_lora_to_linear_modules.
+    n_adapters: int = 1
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -72,6 +77,7 @@ class PeftConfig:
             lora_dtype=d.get("lora_dtype", None),
             use_triton=d.get("use_triton", False),
             moe_rank_scaling=d.get("moe_rank_scaling", False),
+            n_adapters=d.get("n_adapters", 1),
         )
 
 
@@ -562,18 +568,45 @@ def apply_lora_to_linear_modules(
                 if quantization_config is not None and lora_dtype is None:
                     lora_dtype = quantization_config.bnb_4bit_compute_dtype or torch.bfloat16
 
-                patch_linear_module(
-                    module,
-                    dim=peft_config.dim,
-                    alpha=peft_config.alpha,
-                    use_dora=peft_config.use_dora,
-                    dropout=peft_config.dropout,
-                    dropout_position=peft_config.dropout_position,
-                    lora_A_init_method=peft_config.lora_A_init,
-                    lora_dtype=lora_dtype,
-                    use_triton=peft_config.use_triton,
-                    layer_name=name,
-                )
+                if peft_config.n_adapters > 1:
+                    # Multi-adapter dispatch: defer to downstream provider. The
+                    # provider lives outside Automodel (e.g. nousnet) so this
+                    # file stays free of multi-adapter implementation details.
+                    try:
+                        from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
+                    except ImportError as e:
+                        raise RuntimeError(
+                            "peft_config.n_adapters > 1 requires the nousnet "
+                            "package providing MultiLinearLoRA. Install nousnet "
+                            "or set n_adapters=1."
+                        ) from e
+                    new_module = MultiLinearLoRA(
+                        orig_linear=module,
+                        n_adapters=peft_config.n_adapters,
+                        dim=peft_config.dim,
+                        alpha=peft_config.alpha,
+                        lora_A_init_method=peft_config.lora_A_init,
+                        lora_dtype=lora_dtype,
+                    )
+                    if "." not in name:
+                        setattr(model, name, new_module)
+                    else:
+                        parent_name, child_name = name.rsplit(".", 1)
+                        parent = model.get_submodule(parent_name)
+                        setattr(parent, child_name, new_module)
+                else:
+                    patch_linear_module(
+                        module,
+                        dim=peft_config.dim,
+                        alpha=peft_config.alpha,
+                        use_dora=peft_config.use_dora,
+                        dropout=peft_config.dropout,
+                        dropout_position=peft_config.dropout_position,
+                        lora_A_init_method=peft_config.lora_A_init,
+                        lora_dtype=lora_dtype,
+                        use_triton=peft_config.use_triton,
+                        layer_name=name,
+                    )
 
     return num_modules_matched
 
