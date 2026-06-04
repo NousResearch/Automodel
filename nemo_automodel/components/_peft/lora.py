@@ -45,6 +45,11 @@ class PeftConfig:
     lora_A_init: str = "xavier"
     lora_dtype: Optional[torch.dtype] = None
     use_triton: bool = False
+    # Multi-adapter LoRA (skyrl-tx-style stacked tensors).
+    # When num_adapters > 1, apply_lora_to_linear_modules dispatches to
+    # the multi-LoRA injector under nemo_automodel.components._peft.multi_lora.
+    # When num_adapters == 1 (default), the existing single-LoRA path is used.
+    num_adapters: int = 1
 
     def to_dict(self):
         return self.__dict__.copy()
@@ -62,6 +67,7 @@ class PeftConfig:
             lora_A_init=d.get("lora_A_init", "xavier"),
             lora_dtype=d.get("lora_dtype", None),
             use_triton=d.get("use_triton", False),
+            num_adapters=d.get("num_adapters", 1),
         )
 
 
@@ -347,6 +353,39 @@ def apply_lora_to_linear_modules(
     Note:
         target_modules accepts wildcard fragments, e.g. ["q_proj", "k_proj", ".*fc.*"].
     """
+    # Multi-adapter LoRA dispatch.
+    # peft_config.num_adapters > 1 routes through the skyrl-tx-style stacked-tensor
+    # injector implemented in nousnet (NousResearch/nousnet) under
+    # ``nousnet.rl.lora.multi``. Single-adapter (num_adapters == 1, the default)
+    # keeps the existing path entirely intact.
+    # Quantized base is not supported on the multi-adapter path; raise rather
+    # than silently fall through to single-LoRA which would lose num_adapters intent.
+    if peft_config.num_adapters > 1:
+        if quantization_config is not None:
+            raise NotImplementedError(
+                "quantization_config is not supported when num_adapters > 1 (multi-LoRA)."
+            )
+        try:
+            from nousnet.rl.lora.multi import apply_multi_lora_to_model
+        except ImportError as e:
+            raise ImportError(
+                "PeftConfig.num_adapters > 1 requires the `nousnet` package "
+                "(provides nousnet.rl.lora.multi). Install nousnet or set "
+                "num_adapters=1 to use the single-LoRA path."
+            ) from e
+
+        return apply_multi_lora_to_model(
+            model,
+            num_adapters=peft_config.num_adapters,
+            dim=peft_config.dim,
+            alpha=peft_config.alpha,
+            target_modules=peft_config.target_modules or None,
+            exclude_modules=peft_config.exclude_modules or None,
+            match_all_linear=peft_config.match_all_linear,
+            lora_A_init_method=peft_config.lora_A_init,
+        )
+
+    # Single-adapter path (unchanged from upstream).
     # Freeze base model parameters
     for w in model.parameters():
         w.requires_grad_(False)

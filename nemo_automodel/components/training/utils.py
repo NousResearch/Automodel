@@ -302,6 +302,55 @@ def scale_grads_and_clip_grad_norm(
                         if ep_axis_name and ep_axis_name in p.device_mesh.mesh_dim_names:
                             p.grad.div_(ep_ratio)
 
+    # Multi-LoRA dispatch: if any model part has multi-LoRA modules with
+    # num_adapters > 1, replace the global clip with N independent per-slot
+    # clips. The multi-LoRA implementation lives in nousnet
+    # (``nousnet.rl.lora.multi``); we import it lazily so single-LoRA users
+    # (the default) don't need nousnet on PYTHONPATH.
+    # This is byte-equivalent at N=1 to the stock clip path, and at N>1
+    # produces the same gradient state as N independent single-LoRA
+    # training runs would after their own clip_grad_norm_ step.
+    if max_grad_norm is not None and not pp_enabled:
+        try:
+            from nousnet.rl.lora.multi import (
+                clip_grad_norm_per_adapter_model_,
+                iter_multi_lora,
+            )
+        except ImportError:
+            # nousnet not installed — fall through to the single-LoRA path.
+            pass
+        else:
+            multi_lora_modules = [
+                m
+                for mp in model_parts
+                for m in iter_multi_lora(mp)
+                if getattr(m, "num_adapters", 1) > 1
+            ]
+            if multi_lora_modules:
+                # Multi-LoRA path: one clip per adapter slot. Returns a
+                # dict {adapter_idx: pre_clip_norm}. The caller (worker)
+                # logs the max across slots as the reported grad_norm so
+                # the existing logging contract is preserved.
+                per_slot_norms: dict = {}
+                for mp in model_parts:
+                    norms = clip_grad_norm_per_adapter_model_(mp, max_grad_norm, norm_type=norm_type)
+                    for k, v in norms.items():
+                        prev = per_slot_norms.get(k)
+                        per_slot_norms[k] = v if prev is None else torch.maximum(prev, v)
+                if per_slot_norms:
+                    result = torch.stack(list(per_slot_norms.values())).max()
+                    # Convert DTensor → full local tensor → Python float,
+                    # mirroring the stock clip_grad_norm path so downstream
+                    # logging (sft.py:503 `.numpy()`) works on a plain tensor.
+                    if hasattr(result, "full_tensor"):
+                        result = result.full_tensor()
+                    if isinstance(result, torch.Tensor) and result.numel() == 1:
+                        result = result.item()
+                    return result
+                # No grads accumulated yet — return 0.0 to match stock
+                # clip_grad_norm_'s "all-empty" behavior.
+                return 0.0
+
     # Clip with the existing PP/EP-aware helper
     return clip_grad_norm(
         max_grad_norm,
